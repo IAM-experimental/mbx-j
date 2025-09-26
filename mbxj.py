@@ -83,17 +83,16 @@ class GraphSharedMailboxClient:
     
     def authenticate_interactive(self) -> bool:
         """
-        Alternative: Interactive authentication (opens browser)
-        This is more secure than ROPC flow
+        Interactive authentication using device code flow
+        This will handle consent automatically when you first authenticate
         
         Returns:
             bool: True if authentication successful
         """
         try:
-            # Create MSAL app
-            app = msal.ConfidentialClientApplication(
+            # Create MSAL public client app (better for interactive auth)
+            app = msal.PublicClientApplication(
                 client_id=self.client_id,
-                client_credential=self.client_secret,
                 authority=f"https://login.microsoftonline.com/{self.tenant_id}"
             )
             
@@ -107,11 +106,21 @@ class GraphSharedMailboxClient:
                     return True
             
             # If no cached token, initiate device flow
+            print("🔐 Starting authentication process...")
+            print("⚠️  If this is your first time, you'll be asked to consent to permissions.")
+            
             flow = app.initiate_device_flow(scopes=self.scopes)
             if "user_code" not in flow:
                 raise Exception("Failed to create device flow")
             
+            print("\n" + "="*60)
+            print("AUTHENTICATION REQUIRED")
+            print("="*60)
             print(flow["message"])
+            print("="*60)
+            print("ℹ️  After entering the code, you may see a consent screen.")
+            print("ℹ️  Click 'Accept' to grant permissions for the shared mailbox access.")
+            print()
             
             # Wait for user to complete authentication
             result = app.acquire_token_by_device_flow(flow)
@@ -119,14 +128,42 @@ class GraphSharedMailboxClient:
             if "access_token" in result:
                 self.access_token = result["access_token"]
                 logger.info("Successfully authenticated with Graph API")
+                print("✅ Authentication successful! Consent has been granted.")
                 return True
             else:
-                logger.error(f"Authentication failed: {result.get('error_description', 'Unknown error')}")
+                error_msg = result.get('error_description', 'Unknown error')
+                logger.error(f"Authentication failed: {error_msg}")
+                
+                # Provide specific guidance for common consent issues
+                if "consent" in error_msg.lower():
+                    print("\n❌ Consent was not granted. Please try again and click 'Accept' on the consent screen.")
+                elif "AADSTS65001" in error_msg:
+                    print("\n❌ User declined consent. Please try again and accept the permissions.")
+                
                 return False
                 
         except Exception as e:
             logger.error(f"Authentication error: {str(e)}")
             return False
+    
+    def get_consent_url(self) -> str:
+        """
+        Generate a consent URL that can be opened in browser manually
+        Useful if device flow doesn't work in your environment
+        
+        Returns:
+            str: Consent URL
+        """
+        scope_param = " ".join(self.scopes)
+        consent_url = (
+            f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/authorize?"
+            f"client_id={self.client_id}&"
+            f"response_type=code&"
+            f"redirect_uri=http://localhost&"
+            f"scope={scope_param}&"
+            f"response_mode=query"
+        )
+        return consent_url
     
     def _make_request(self, endpoint: str, method: str = "GET", data: Dict = None) -> Optional[Dict]:
         """
@@ -375,8 +412,8 @@ def main():
     TENANT_ID = "your-tenant-id"  # Azure Tenant ID
     SHARED_MAILBOX = "shared-mailbox@domain.com"  # Shared mailbox email
     
-    # User credentials
-    USERNAME = "your-username@domain.com"  # Your user account
+    # User credentials (only needed for username/password auth)
+    USERNAME = "bilbo@domain.com"  # Your user account
     PASSWORD = "your-password"  # Your password
     
     print("Microsoft Graph API Shared Mailbox Client")
@@ -386,20 +423,41 @@ def main():
     client = GraphSharedMailboxClient(CLIENT_ID, CLIENT_SECRET, TENANT_ID, SHARED_MAILBOX)
     
     # Choose authentication method
-    auth_method = input("Choose authentication method:\n1. Username/Password\n2. Interactive (Browser)\nEnter choice (1 or 2): ").strip()
+    print("Choose authentication method:")
+    print("1. Username/Password (ROPC)")
+    print("2. Interactive Device Code (Recommended)")
+    print("3. Generate consent URL manually")
+    
+    auth_method = input("\nEnter choice (1, 2, or 3): ").strip()
     
     if auth_method == "1":
-        # Authenticate with username/password
+        print(f"\n🔑 Authenticating as {USERNAME}...")
         if not client.authenticate(USERNAME, PASSWORD):
-            print("Authentication failed!")
+            print("❌ Authentication failed!")
+            print("💡 Try interactive authentication (option 2) if you haven't consented yet.")
             return
+    elif auth_method == "3":
+        # Generate consent URL for manual consent
+        consent_url = client.get_consent_url()
+        print(f"\n🌐 Open this URL in your browser to provide consent:")
+        print(f"\n{consent_url}\n")
+        print("📋 Steps:")
+        print("1. Copy the URL above")
+        print("2. Open it in your browser")
+        print("3. Login as bilbo@domain.com")
+        print("4. Click 'Accept' on the consent screen")
+        print("5. Come back and run the script again with option 1 or 2")
+        return
     else:
-        # Interactive authentication
+        # Interactive authentication (handles consent automatically)
+        print(f"\n🔑 Starting interactive authentication for {USERNAME}...")
         if not client.authenticate_interactive():
-            print("Authentication failed!")
+            print("❌ Authentication failed!")
+            print("💡 Make sure to accept the consent screen when prompted.")
             return
     
     print(f"\n✅ Successfully connected to shared mailbox: {SHARED_MAILBOX}")
+    print(f"👤 Authenticated as: bilbo")
     
     try:
         # Display available folders
@@ -437,7 +495,57 @@ def main():
         
     except Exception as e:
         logger.error(f"Error during operations: {str(e)}")
+        
+        # Provide helpful error messages
+        if "Insufficient privileges" in str(e):
+            print("\n❌ Error: Insufficient privileges")
+            print("💡 Make sure:")
+            print("   - You have 'Full Access' to the shared mailbox")
+            print("   - You've provided consent for the required permissions")
+        elif "Forbidden" in str(e):
+            print("\n❌ Error: Access forbidden")
+            print("💡 This usually means consent hasn't been granted yet.")
+            print("   Try running the script again with option 3 to generate a consent URL.")
+
+
+def setup_instructions():
+    """
+    Print setup instructions for first-time users
+    """
+    print("\n" + "="*70)
+    print("FIRST TIME SETUP INSTRUCTIONS")
+    print("="*70)
+    print("1. 🏢 Azure App Registration Setup:")
+    print("   - Go to Azure Portal → App Registrations → New Registration")
+    print("   - Name: 'Shared Mailbox Access'")
+    print("   - Redirect URI: http://localhost (Public client)")
+    print("")
+    print("2. 🔐 Add Delegated Permissions:")
+    print("   - Go to 'API Permissions'")
+    print("   - Add permission → Microsoft Graph → Delegated permissions")
+    print("   - Add: Mail.Read.Shared, Mail.Send.Shared, Mail.ReadWrite.Shared")
+    print("")
+    print("3. ⚙️  Configure Authentication:")
+    print("   - Go to 'Authentication'")
+    print("   - Enable 'Allow public client flows' = Yes")
+    print("")
+    print("4. 🔑 Create Client Secret (if using confidential client):")
+    print("   - Go to 'Certificates & secrets'")
+    print("   - New client secret")
+    print("")
+    print("5. 🎯 Grant User Consent:")
+    print("   - Run this script and choose option 3 to generate consent URL")
+    print("   - Or run option 2 for interactive consent")
+    print("")
+    print("6. 📧 Ensure Mailbox Access:")
+    print("   - Admin must grant 'Full Access' to shared mailbox for user 'bilbo'")
+    print("="*70)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+        setup_instructions()
+    else:
+        main()
