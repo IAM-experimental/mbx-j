@@ -1,4 +1,4 @@
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Comment
 import re
 
 
@@ -13,6 +13,11 @@ def html_to_jira_markup(html_content: str) -> str:
         JIRA-formatted markup string
     """
     soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Remove all HTML comments
+    from bs4 import Comment
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
     
     def process_element(element, list_type=None, list_level=0):
         """Recursively process HTML elements and convert to JIRA markup."""
