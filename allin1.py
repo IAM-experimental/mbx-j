@@ -2,6 +2,7 @@
 """
 Email to JIRA Ticket Converter
 Processes emails from Exchange Online and creates JIRA tickets
+Uses MSAL with ROPC (Resource Owner Password Credentials) flow
 """
 
 import os
@@ -12,7 +13,7 @@ import requests
 from jira import JIRA
 from jinja2 import Template
 import base64
-import mimetypes
+import msal
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,7 @@ TENANT_ID = os.getenv('TENANT_ID', 'your-tenant-id')
 CLIENT_ID = os.getenv('CLIENT_ID', 'your-client-id')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', 'your-client-secret')
 MAILBOX_USER = os.getenv('MAILBOX_USER', 'user@domain.com')
+MAILBOX_PASSWORD = os.getenv('MAILBOX_PASSWORD', 'mailbox-password')
 
 # JIRA Configuration
 JIRA_URL = os.getenv('JIRA_URL', 'https://your-company.atlassian.net')
@@ -151,32 +153,58 @@ EMAIL_TEMPLATE = """
 
 
 class GraphAPIClient:
-    """Handles Microsoft Graph API authentication and operations"""
+    """Handles Microsoft Graph API authentication and operations using MSAL"""
     
-    def __init__(self, tenant_id: str, client_id: str, client_secret: str):
+    def __init__(self, tenant_id: str, client_id: str, client_secret: str, 
+                 username: str, password: str):
         self.tenant_id = tenant_id
         self.client_id = client_id
         self.client_secret = client_secret
+        self.username = username
+        self.password = password
         self.access_token = None
         self.graph_endpoint = 'https://graph.microsoft.com/v1.0'
+        
+        # Initialize MSAL Confidential Client Application
+        authority = f'https://login.microsoftonline.com/{tenant_id}'
+        self.app = msal.ConfidentialClientApplication(
+            client_id=client_id,
+            client_credential=client_secret,
+            authority=authority
+        )
     
     def get_access_token(self) -> str:
-        """Obtain access token using client credentials flow"""
-        token_url = f'https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token'
-        
-        data = {
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'scope': 'https://graph.microsoft.com/.default',
-            'grant_type': 'client_credentials'
-        }
+        """Obtain access token using ROPC (Resource Owner Password Credentials) flow"""
+        scopes = ['https://graph.microsoft.com/.default']
         
         try:
-            response = requests.post(token_url, data=data)
-            response.raise_for_status()
-            self.access_token = response.json()['access_token']
-            logger.info("Successfully obtained access token")
-            return self.access_token
+            # Try ROPC flow
+            result = self.app.acquire_token_by_username_password(
+                username=self.username,
+                password=self.password,
+                scopes=scopes
+            )
+            
+            if "access_token" in result:
+                self.access_token = result['access_token']
+                logger.info("Successfully obtained access token via ROPC")
+                return self.access_token
+            else:
+                error = result.get("error")
+                error_desc = result.get("error_description")
+                logger.error(f"Failed to obtain token: {error} - {error_desc}")
+                
+                # If ROPC fails, try client credentials as fallback
+                logger.info("Attempting client credentials flow as fallback...")
+                result = self.app.acquire_token_for_client(scopes=scopes)
+                
+                if "access_token" in result:
+                    self.access_token = result['access_token']
+                    logger.info("Successfully obtained access token via client credentials")
+                    return self.access_token
+                else:
+                    raise Exception(f"Authentication failed: {result.get('error_description')}")
+                    
         except Exception as e:
             logger.error(f"Failed to obtain access token: {e}")
             raise
@@ -190,9 +218,10 @@ class GraphAPIClient:
             'Content-Type': 'application/json'
         }
     
-    def get_folder_id(self, user_email: str, folder_name: str) -> str:
+    def get_folder_id(self, folder_name: str) -> str:
         """Get the folder ID for a specific folder name"""
-        url = f'{self.graph_endpoint}/users/{user_email}/mailFolders'
+        # Using 'me' endpoint since we're authenticating as the user
+        url = f'{self.graph_endpoint}/me/mailFolders'
         
         try:
             response = requests.get(url, headers=self._get_headers())
@@ -202,15 +231,17 @@ class GraphAPIClient:
             # Search in all folders including subfolders
             for folder in folders:
                 if folder['displayName'] == folder_name:
+                    logger.info(f"Found folder '{folder_name}' with ID: {folder['id']}")
                     return folder['id']
                 
                 # Check child folders
-                child_url = f"{self.graph_endpoint}/users/{user_email}/mailFolders/{folder['id']}/childFolders"
+                child_url = f"{self.graph_endpoint}/me/mailFolders/{folder['id']}/childFolders"
                 child_response = requests.get(child_url, headers=self._get_headers())
                 if child_response.ok:
                     child_folders = child_response.json().get('value', [])
                     for child in child_folders:
                         if child['displayName'] == folder_name:
+                            logger.info(f"Found folder '{folder_name}' with ID: {child['id']}")
                             return child['id']
             
             logger.error(f"Folder '{folder_name}' not found")
@@ -219,12 +250,13 @@ class GraphAPIClient:
             logger.error(f"Error getting folder ID: {e}")
             raise
     
-    def get_messages_from_folder(self, user_email: str, folder_id: str, limit: int = 10) -> List[Dict]:
+    def get_messages_from_folder(self, folder_id: str, limit: int = 10) -> List[Dict]:
         """Retrieve messages from a specific folder"""
-        url = f'{self.graph_endpoint}/users/{user_email}/mailFolders/{folder_id}/messages'
+        url = f'{self.graph_endpoint}/me/mailFolders/{folder_id}/messages'
         params = {
             '$top': limit,
-            '$orderby': 'receivedDateTime desc'
+            '$orderby': 'receivedDateTime desc',
+            '$select': 'id,subject,from,body,receivedDateTime,hasAttachments'
         }
         
         try:
@@ -237,23 +269,23 @@ class GraphAPIClient:
             logger.error(f"Error retrieving messages: {e}")
             raise
     
-    def get_attachments(self, user_email: str, message_id: str) -> List[Dict]:
+    def get_attachments(self, message_id: str) -> List[Dict]:
         """Get all attachments from a message"""
-        url = f'{self.graph_endpoint}/users/{user_email}/messages/{message_id}/attachments'
+        url = f'{self.graph_endpoint}/me/messages/{message_id}/attachments'
         
         try:
             response = requests.get(url, headers=self._get_headers())
             response.raise_for_status()
             attachments = response.json()['value']
-            logger.info(f"Retrieved {len(attachments)} attachments")
+            logger.info(f"Retrieved {len(attachments)} attachments for message {message_id}")
             return attachments
         except Exception as e:
             logger.error(f"Error retrieving attachments: {e}")
             return []
     
-    def send_email(self, user_email: str, to_email: str, subject: str, html_body: str):
+    def send_email(self, to_email: str, subject: str, html_body: str):
         """Send an email using Microsoft Graph API"""
-        url = f'{self.graph_endpoint}/users/{user_email}/sendMail'
+        url = f'{self.graph_endpoint}/me/sendMail'
         
         message = {
             'message': {
@@ -269,7 +301,8 @@ class GraphAPIClient:
                         }
                     }
                 ]
-            }
+            },
+            'saveToSentItems': 'true'
         }
         
         try:
@@ -280,9 +313,20 @@ class GraphAPIClient:
             logger.error(f"Error sending email: {e}")
             raise
     
-    def move_message(self, user_email: str, message_id: str, destination_folder_id: str):
+    def delete_message(self, message_id: str):
+        """Delete a message (move to Deleted Items)"""
+        url = f'{self.graph_endpoint}/me/messages/{message_id}'
+        
+        try:
+            response = requests.delete(url, headers=self._get_headers())
+            response.raise_for_status()
+            logger.info(f"Message {message_id} deleted successfully")
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
+    
+    def move_message(self, message_id: str, destination_folder_id: str):
         """Move a message to another folder"""
-        url = f'{self.graph_endpoint}/users/{user_email}/messages/{message_id}/move'
+        url = f'{self.graph_endpoint}/me/messages/{message_id}/move'
         
         data = {
             'destinationId': destination_folder_id
@@ -307,7 +351,7 @@ class JiraTicketCreator:
         """Create a JIRA ticket"""
         issue_dict = {
             'project': {'key': project_key},
-            'summary': summary,
+            'summary': summary[:255],  # Limit summary length
             'description': description,
             'issuetype': {'name': 'Task'}
         }
@@ -323,28 +367,34 @@ class JiraTicketCreator:
     def add_attachment(self, issue_key: str, filename: str, file_content: bytes):
         """Add an attachment to a JIRA ticket"""
         try:
-            self.jira.add_attachment(issue=issue_key, attachment=file_content, filename=filename)
+            # Create a file-like object from bytes
+            from io import BytesIO
+            file_obj = BytesIO(file_content)
+            file_obj.name = filename
+            
+            self.jira.add_attachment(issue=issue_key, attachment=file_obj, filename=filename)
             logger.info(f"Added attachment {filename} to {issue_key}")
         except Exception as e:
-            logger.error(f"Error adding attachment: {e}")
+            logger.error(f"Error adding attachment {filename}: {e}")
 
 
 def extract_email_body(email_message: Dict) -> str:
     """Extract plain text body from email message"""
     body = email_message.get('body', {})
     content = body.get('content', '')
+    content_type = body.get('contentType', 'text')
     
-    # If HTML, try to extract plain text (simple approach)
-    if body.get('contentType') == 'html':
-        # For better HTML parsing, consider using BeautifulSoup
-        # For now, return as-is for JIRA (JIRA supports HTML)
+    # JIRA supports some HTML, but let's keep it clean
+    if content_type == 'html':
+        # For better HTML parsing, you could use BeautifulSoup
+        # For now, return as-is
         return content
     
     return content
 
 
 def process_email_to_jira(graph_client: GraphAPIClient, jira_client: JiraTicketCreator, 
-                          email_message: Dict, mailbox_user: str):
+                          email_message: Dict):
     """Process a single email and create a JIRA ticket"""
     
     try:
@@ -354,26 +404,38 @@ def process_email_to_jira(graph_client: GraphAPIClient, jira_client: JiraTicketC
         sender_email = sender['address']
         sender_name = sender.get('name', sender_email)
         message_id = email_message['id']
+        received_date = email_message.get('receivedDateTime', '')
         
         logger.info(f"Processing email from {sender_email}: {subject}")
         
         # Extract body
         body = extract_email_body(email_message)
         
+        # Prepare description with metadata
+        description = f"""*Original Email from:* {sender_name} <{sender_email}>
+*Received:* {received_date}
+*Subject:* {subject}
+
+----
+
+{body}
+"""
+        
         # Create JIRA ticket
         jira_issue = jira_client.create_ticket(
             summary=subject,
-            description=f"Original Email from: {sender_name} <{sender_email}>\n\n{body}",
+            description=description,
             project_key=JIRA_PROJECT_KEY
         )
         
         # Get and attach files
-        attachments = graph_client.get_attachments(mailbox_user, message_id)
-        for attachment in attachments:
-            if attachment.get('@odata.type') == '#microsoft.graph.fileAttachment':
-                filename = attachment['name']
-                content_bytes = base64.b64decode(attachment['contentBytes'])
-                jira_client.add_attachment(jira_issue.key, filename, content_bytes)
+        if email_message.get('hasAttachments'):
+            attachments = graph_client.get_attachments(message_id)
+            for attachment in attachments:
+                if attachment.get('@odata.type') == '#microsoft.graph.fileAttachment':
+                    filename = attachment['name']
+                    content_bytes = base64.b64decode(attachment['contentBytes'])
+                    jira_client.add_attachment(jira_issue.key, filename, content_bytes)
         
         # Send confirmation email
         template = Template(EMAIL_TEMPLATE)
@@ -386,39 +448,48 @@ def process_email_to_jira(graph_client: GraphAPIClient, jira_client: JiraTicketC
         )
         
         graph_client.send_email(
-            user_email=mailbox_user,
             to_email=sender_email,
             subject=f"Your request has been converted to ticket {jira_issue.key}",
             html_body=html_body
         )
         
+        # Delete the processed email from the folder
+        graph_client.delete_message(message_id)
+        
         logger.info(f"Successfully processed email and created ticket {jira_issue.key}")
         return True
         
     except Exception as e:
-        logger.error(f"Error processing email {email_message.get('id')}: {e}")
+        logger.error(f"Error processing email {email_message.get('id')}: {e}", exc_info=True)
         return False
 
 
 def main():
     """Main execution function"""
     logger.info("=" * 80)
-    logger.info("Starting Email to JIRA Converter")
+    logger.info("Starting Email to JIRA Converter (MSAL ROPC)")
     logger.info("=" * 80)
     
     try:
         # Initialize clients
-        graph_client = GraphAPIClient(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+        graph_client = GraphAPIClient(
+            tenant_id=TENANT_ID,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            username=MAILBOX_USER,
+            password=MAILBOX_PASSWORD
+        )
+        
         jira_client = JiraTicketCreator(JIRA_URL, JIRA_USER, JIRA_PASSWORD)
         
         # Get folder ID
-        folder_id = graph_client.get_folder_id(MAILBOX_USER, FOLDER_NAME)
+        folder_id = graph_client.get_folder_id(FOLDER_NAME)
         if not folder_id:
             logger.error(f"Could not find folder '{FOLDER_NAME}'")
             return
         
         # Get messages
-        messages = graph_client.get_messages_from_folder(MAILBOX_USER, folder_id, BATCH_SIZE)
+        messages = graph_client.get_messages_from_folder(folder_id, BATCH_SIZE)
         
         if not messages:
             logger.info("No messages to process")
@@ -427,7 +498,7 @@ def main():
         # Process each message
         success_count = 0
         for message in messages:
-            if process_email_to_jira(graph_client, jira_client, message, MAILBOX_USER):
+            if process_email_to_jira(graph_client, jira_client, message):
                 success_count += 1
         
         logger.info(f"Processed {success_count}/{len(messages)} emails successfully")
