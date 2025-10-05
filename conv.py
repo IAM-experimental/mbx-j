@@ -193,8 +193,8 @@ def html_to_jira_markup(html_content: str) -> str:
     return jira_markup.strip()
 
 
-# Example usage
-if __name__ == '__main__':
+def _example_usage():
+    """Example usage of the converter."""
     sample_html = """
     <h1>Bug Report</h1>
     <p>This is a <strong>critical</strong> issue with <em>high priority</em>.</p>
@@ -215,3 +215,7 @@ if __name__ == '__main__':
     """
     
     print(html_to_jira_markup(sample_html))
+
+
+if __name__ == '__main__':
+    _example_usage()
